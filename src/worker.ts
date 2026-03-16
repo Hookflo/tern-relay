@@ -34,17 +34,9 @@ function generateSessionId(length = 8): string {
 
 // ── Worker entrypoint ────────────────────────────────────────────────────────
 //
-// Two URL patterns:
-//
-// 1. CLI connects (WebSocket upgrade):
-//    GET wss://tern-relay.hookflo-tern.workers.dev/connect
-//    → creates session, returns { url, sessionId }
-//
-// 2. Platform sends webhook:
-//    POST https://tern-relay.hookflo-tern.workers.dev/s/<sessionId>/webhook
-//    → pipes to CLI over open WebSocket
-//
-// No subdomain routing needed — everything is path-based.
+// ALL requests route to a SINGLE Durable Object instance called "global".
+// That one instance holds ALL active WebSocket sessions in a Map.
+// This guarantees the same instance handles both WS connect and HTTP POST.
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -52,39 +44,33 @@ export default {
     const isWsUpgrade =
       request.headers.get("upgrade")?.toLowerCase() === "websocket";
 
-    // ── /connect — CLI WebSocket upgrade
+    // Always route to the single global DO instance
+    const stub = env.SESSIONS.get(env.SESSIONS.idFromName("global"));
+
+    // /connect — CLI WebSocket upgrade
     if (url.pathname === "/connect" && isWsUpgrade) {
       const sessionId = generateSessionId();
-      const stub = env.SESSIONS.get(env.SESSIONS.idFromName(sessionId));
       return stub.fetch(
         new Request(`https://session/connect?sessionId=${sessionId}`, request),
       );
     }
 
-    // ── /s/<sessionId>/<...path> — incoming webhook from platform
+    // /s/<sessionId>/<...path> — incoming webhook from platform
     const match = url.pathname.match(/^\/s\/([a-z0-9]+)(\/.*)?$/);
     if (match) {
       const sessionId = match[1];
       const webhookPath = match[2] || "/";
-      const id = env.SESSIONS.idFromName(sessionId);
-      const stub = env.SESSIONS.get(id);
-
-      // Add this log
-      console.log(
-        `Forwarding to session: ${sessionId}, DO id: ${id.toString()}`,
-      );
-
       return stub.fetch(
-        new Request(`https://session/forward${webhookPath}`, request),
+        new Request(
+          `https://session/forward/${sessionId}${webhookPath}`,
+          request,
+        ),
       );
     }
 
-    // ── health check
+    // /health
     if (url.pathname === "/health") {
-      return new Response(JSON.stringify({ ok: true }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
+      return stub.fetch(new Request("https://session/health", request));
     }
 
     return new Response("Not found", { status: 404 });
@@ -92,28 +78,20 @@ export default {
 };
 
 // ── SessionDurableObject ─────────────────────────────────────────────────────
-// One instance per active CLI session.
-// Holds exactly one WebSocket (the CLI connection).
-// No storage. No logging. Pure pipe.
+// Single global instance — holds ALL active sessions in one Map.
 
 export class SessionDurableObject extends DurableObject {
-  private cliSocket: WebSocket | null = null;
-  private sessionId: string = "";
+  private sessions: Map<string, WebSocket> = new Map();
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    console.log(
-      `DO fetch: ${url.pathname}, hasSocket: ${this.cliSocket !== null}, sessionId: ${this.sessionId}`,
-    );
+    const isWsUpgrade =
+      request.headers.get("upgrade")?.toLowerCase() === "websocket";
 
-    // ── /connect — CLI establishing tunnel
+    // /connect — CLI establishing tunnel
     if (url.pathname === "/connect") {
-      const sessionId =
-        url.searchParams.get("sessionId") ?? generateSessionId();
-      this.sessionId = sessionId;
+      const sessionId = url.searchParams.get("sessionId")!;
 
-      const isWsUpgrade =
-        request.headers.get("upgrade")?.toLowerCase() === "websocket";
       if (!isWsUpgrade) {
         return new Response("Expected WebSocket upgrade", { status: 426 });
       }
@@ -123,18 +101,15 @@ export class SessionDurableObject extends DurableObject {
         WebSocket,
       ];
 
-      this.ctx.acceptWebSocket(server);
-      this.cliSocket = server;
+      this.ctx.acceptWebSocket(server, [sessionId]);
+      this.sessions.set(sessionId, server);
 
-      // Build public URL using path-based routing
-      // Works on both workers.dev and custom domain
       const host =
         request.headers.get("x-forwarded-host") ??
         request.headers.get("host") ??
         "tern-relay.hookflo-tern.workers.dev";
 
-      // Strip the /connect path to get the base URL
-      const baseUrl = `https://${host}`;
+      const baseUrl = `https://${host.replace(":8787", "")}`;
       const publicUrl = `${baseUrl}/s/${sessionId}`;
 
       const msg: RelayConnected = {
@@ -147,27 +122,45 @@ export class SessionDurableObject extends DurableObject {
       return new Response(null, { status: 101, webSocket: client });
     }
 
-    // ── /forward/* — incoming webhook from platform
-    if (url.pathname.startsWith("/forward")) {
-      if (!this.cliSocket) {
+    // /forward/<sessionId>/<...path> — incoming webhook
+    if (url.pathname.startsWith("/forward/")) {
+      const forwardMatch = url.pathname.match(
+        /^\/forward\/([a-z0-9]+)(\/.*)?$/,
+      );
+      if (!forwardMatch) {
+        return new Response("Bad request", { status: 400 });
+      }
+
+      const sessionId = forwardMatch[1];
+      const webhookPath = forwardMatch[2] || "/";
+
+      // Try in-memory map first
+      let socket = this.sessions.get(sessionId);
+
+      // Fall back to hibernation websockets
+      if (!socket) {
+        const hibernated = this.ctx.getWebSockets(sessionId);
+        if (hibernated.length > 0) {
+          socket = hibernated[0];
+          this.sessions.set(sessionId, socket);
+        }
+      }
+
+      if (!socket) {
         return new Response(
           JSON.stringify({ error: "No CLI connected. Start tern-dev first." }),
           { status: 404, headers: { "content-type": "application/json" } },
         );
       }
 
-      // Raw body — no parsing, no inspection
       const body = await request.text();
 
-      // Serialise headers — strip CF internal headers
       const headers: Record<string, string> = {};
       request.headers.forEach((value, key) => {
         if (!key.startsWith("cf-") && key !== "host") {
           headers[key] = value;
         }
       });
-
-      const webhookPath = url.pathname.replace("/forward", "") || "/";
 
       const msg: RelayRequest = {
         type: "request",
@@ -179,11 +172,14 @@ export class SessionDurableObject extends DurableObject {
         receivedAt: new Date().toISOString(),
       };
 
-      // Fire and forget — return 200 immediately
       try {
-        this.cliSocket.send(JSON.stringify(msg));
+        socket.send(JSON.stringify(msg));
       } catch {
-        // CLI disconnected mid-send — not an error
+        this.sessions.delete(sessionId);
+        return new Response(
+          JSON.stringify({ error: "CLI disconnected. Restart tern-dev." }),
+          { status: 404, headers: { "content-type": "application/json" } },
+        );
       }
 
       return new Response(JSON.stringify({ received: true }), {
@@ -192,20 +188,39 @@ export class SessionDurableObject extends DurableObject {
       });
     }
 
+    // /health
+    if (url.pathname === "/health") {
+      const hibernated = this.ctx.getWebSockets();
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          activeSessions: hibernated.length,
+          memSessions: this.sessions.size,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+
     return new Response("Not found", { status: 404 });
   }
 
-  // ── WebSocket hibernation handlers
-
-  webSocketMessage(_ws: WebSocket, _message: string | ArrayBuffer) {
-    // CLI can send pings — ignore
-  }
+  webSocketMessage(_ws: WebSocket, _message: string | ArrayBuffer) {}
 
   webSocketClose(_ws: WebSocket, _code: number, _reason: string) {
-    this.cliSocket = null;
+    for (const [id, socket] of this.sessions.entries()) {
+      if (socket === _ws) {
+        this.sessions.delete(id);
+        break;
+      }
+    }
   }
 
   webSocketError(_ws: WebSocket, _error: unknown) {
-    this.cliSocket = null;
+    for (const [id, socket] of this.sessions.entries()) {
+      if (socket === _ws) {
+        this.sessions.delete(id);
+        break;
+      }
+    }
   }
 }
