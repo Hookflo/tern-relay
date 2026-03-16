@@ -116,7 +116,9 @@ export class SessionDurableObject extends DurableObject {
       this.cliSocket = server;
 
       // Tell CLI its public URL
-      const publicUrl = `https://${sessionId}.relay.tern.dev`;
+      const host = request.headers.get("host") ?? "relay.tern.dev";
+      const baseHost = host.replace(/^[^.]+\./, ""); // strips any subdomain
+      const publicUrl = `https://${sessionId}.${baseHost}`;
       const msg: RelayConnected = {
         type: "connected",
         url: publicUrl,
