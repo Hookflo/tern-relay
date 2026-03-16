@@ -66,7 +66,14 @@ export default {
     if (match) {
       const sessionId = match[1];
       const webhookPath = match[2] || "/";
-      const stub = env.SESSIONS.get(env.SESSIONS.idFromName(sessionId));
+      const id = env.SESSIONS.idFromName(sessionId);
+      const stub = env.SESSIONS.get(id);
+
+      // Add this log
+      console.log(
+        `Forwarding to session: ${sessionId}, DO id: ${id.toString()}`,
+      );
+
       return stub.fetch(
         new Request(`https://session/forward${webhookPath}`, request),
       );
@@ -95,6 +102,9 @@ export class SessionDurableObject extends DurableObject {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    console.log(
+      `DO fetch: ${url.pathname}, hasSocket: ${this.cliSocket !== null}, sessionId: ${this.sessionId}`,
+    );
 
     // ── /connect — CLI establishing tunnel
     if (url.pathname === "/connect") {
