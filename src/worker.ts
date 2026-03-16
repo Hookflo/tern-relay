@@ -32,30 +32,28 @@ function generateSessionId(length = 8): string {
   return Array.from(bytes, (b) => CHARSET[b % CHARSET.length]).join("");
 }
 
-function extractSessionId(host: string): string | null {
-  // abc12345.relay.tern.dev → abc12345
-  const match = host.match(/^([a-z0-9]+)\./);
-  return match ? match[1] : null;
-}
-
 // ── Worker entrypoint ────────────────────────────────────────────────────────
+//
+// Two URL patterns:
+//
+// 1. CLI connects (WebSocket upgrade):
+//    GET wss://tern-relay.hookflo-tern.workers.dev/connect
+//    → creates session, returns { url, sessionId }
+//
+// 2. Platform sends webhook:
+//    POST https://tern-relay.hookflo-tern.workers.dev/s/<sessionId>/webhook
+//    → pipes to CLI over open WebSocket
+//
+// No subdomain routing needed — everything is path-based.
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    const host = request.headers.get("host") ?? "";
-
-    // ── WebSocket upgrade from tern-dev CLI
-    // CLI connects to wss://relay.tern.dev (no subdomain)
-    // or wss://relay.tern.dev/connect
-    const isRelayRoot =
-      host === "relay.tern.dev" ||
-      host.startsWith("localhost") ||
-      host.endsWith("workers.dev");
     const isWsUpgrade =
       request.headers.get("upgrade")?.toLowerCase() === "websocket";
 
-    if (isWsUpgrade && isRelayRoot) {
+    // ── /connect — CLI WebSocket upgrade
+    if (url.pathname === "/connect" && isWsUpgrade) {
       const sessionId = generateSessionId();
       const stub = env.SESSIONS.get(env.SESSIONS.idFromName(sessionId));
       return stub.fetch(
@@ -63,19 +61,23 @@ export default {
       );
     }
 
-    // ── Incoming HTTP POST from platform (Stripe, GitHub etc.)
-    // Arrives at: https://abc12345.relay.tern.dev/any/path
-    const sessionId = extractSessionId(host);
-
-    if (sessionId) {
+    // ── /s/<sessionId>/<...path> — incoming webhook from platform
+    const match = url.pathname.match(/^\/s\/([a-z0-9]+)(\/.*)?$/);
+    if (match) {
+      const sessionId = match[1];
+      const webhookPath = match[2] || "/";
       const stub = env.SESSIONS.get(env.SESSIONS.idFromName(sessionId));
-      // Forward to the DO — it will pipe to CLI and return immediately
       return stub.fetch(
-        new Request(
-          `https://session/forward${url.pathname}${url.search}`,
-          request,
-        ),
+        new Request(`https://session/forward${webhookPath}`, request),
       );
+    }
+
+    // ── health check
+    if (url.pathname === "/health") {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
     }
 
     return new Response("Not found", { status: 404 });
@@ -94,7 +96,7 @@ export class SessionDurableObject extends DurableObject {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
-    // ── /connect — CLI is establishing the tunnel
+    // ── /connect — CLI establishing tunnel
     if (url.pathname === "/connect") {
       const sessionId =
         url.searchParams.get("sessionId") ?? generateSessionId();
@@ -111,14 +113,20 @@ export class SessionDurableObject extends DurableObject {
         WebSocket,
       ];
 
-      // Use hibernation API — zero idle cost when CLI is waiting
       this.ctx.acceptWebSocket(server);
       this.cliSocket = server;
 
-      // Tell CLI its public URL
-      const host = request.headers.get("host") ?? "relay.tern.dev";
-      const baseHost = host.replace(/^[^.]+\./, ""); // strips any subdomain
-      const publicUrl = `https://${sessionId}.${baseHost}`;
+      // Build public URL using path-based routing
+      // Works on both workers.dev and custom domain
+      const host =
+        request.headers.get("x-forwarded-host") ??
+        request.headers.get("host") ??
+        "tern-relay.hookflo-tern.workers.dev";
+
+      // Strip the /connect path to get the base URL
+      const baseUrl = `https://${host}`;
+      const publicUrl = `${baseUrl}/s/${sessionId}`;
+
       const msg: RelayConnected = {
         type: "connected",
         url: publicUrl,
@@ -132,13 +140,16 @@ export class SessionDurableObject extends DurableObject {
     // ── /forward/* — incoming webhook from platform
     if (url.pathname.startsWith("/forward")) {
       if (!this.cliSocket) {
-        return new Response("No CLI connected", { status: 404 });
+        return new Response(
+          JSON.stringify({ error: "No CLI connected. Start tern-dev first." }),
+          { status: 404, headers: { "content-type": "application/json" } },
+        );
       }
 
-      // Read raw body — no parsing, no inspection
+      // Raw body — no parsing, no inspection
       const body = await request.text();
 
-      // Serialise headers — filter out CF internal headers
+      // Serialise headers — strip CF internal headers
       const headers: Record<string, string> = {};
       request.headers.forEach((value, key) => {
         if (!key.startsWith("cf-") && key !== "host") {
@@ -146,24 +157,25 @@ export class SessionDurableObject extends DurableObject {
         }
       });
 
+      const webhookPath = url.pathname.replace("/forward", "") || "/";
+
       const msg: RelayRequest = {
         type: "request",
         id: `req_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
         method: request.method,
-        path: url.pathname.replace("/forward", "") || "/",
+        path: webhookPath,
         headers,
         body,
         receivedAt: new Date().toISOString(),
       };
 
-      // Fire and forget — do not wait for CLI to process
+      // Fire and forget — return 200 immediately
       try {
         this.cliSocket.send(JSON.stringify(msg));
       } catch {
-        // CLI disconnected between check and send — not an error
+        // CLI disconnected mid-send — not an error
       }
 
-      // Always return 200 to the platform immediately
       return new Response(JSON.stringify({ received: true }), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -174,19 +186,16 @@ export class SessionDurableObject extends DurableObject {
   }
 
   // ── WebSocket hibernation handlers
-  // Called by CF runtime when a hibernated WebSocket receives a message
 
-  webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
-    // CLI can send { type: "ping" } to keep connection alive — ignore everything else
-    // We never need to process CLI messages in the relay
+  webSocketMessage(_ws: WebSocket, _message: string | ArrayBuffer) {
+    // CLI can send pings — ignore
   }
 
-  webSocketClose(ws: WebSocket, code: number, reason: string) {
+  webSocketClose(_ws: WebSocket, _code: number, _reason: string) {
     this.cliSocket = null;
-    // DO idles — no cleanup needed
   }
 
-  webSocketError(ws: WebSocket, error: unknown) {
+  webSocketError(_ws: WebSocket, _error: unknown) {
     this.cliSocket = null;
   }
 }
