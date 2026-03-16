@@ -10,7 +10,7 @@ bindings = [
 
 [[migrations]]
 tag = "v1"
-new_classes = ["SessionDurableObject"]
+new_sqlite_classes = ["SessionDurableObject"]
 
 # ── Custom domain ─────────────────────────────────────────────────────────────
 # Set up wildcard subdomain in Cloudflare dashboard:
