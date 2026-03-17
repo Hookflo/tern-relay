@@ -8,24 +8,13 @@ bindings = [
   { name = "SESSIONS", class_name = "SessionDurableObject" }
 ]
 
+# ── If you already deployed with tag "v1", bump to "v2" here
+# ── If deploying fresh, "v1" is fine
 [[migrations]]
-tag = "v1"
+tag = "v2"
 new_sqlite_classes = ["SessionDurableObject"]
 
-# ── Custom domain ─────────────────────────────────────────────────────────────
-# Set up wildcard subdomain in Cloudflare dashboard:
-#   *.relay.tern.dev  →  this Worker
-#    relay.tern.dev   →  this Worker  (CLI connects here for WS upgrade)
-#
-# Uncomment after domain is configured:
+# ── Uncomment and fill in after setting up custom domain in CF dashboard
 # [[routes]]
-# pattern = "relay.tern.dev/*"
-# zone_name = "tern.dev"
-#
-# [[routes]]
-# pattern = "*.relay.tern.dev/*"
-# zone_name = "tern.dev"
-
-# ── Local dev ─────────────────────────────────────────────────────────────────
-# wrangler dev binds to localhost:8787
-# CLI: RELAY_URL=ws://localhost:8787 npx @hookflo/tern-dev --port 3000
+# pattern = "relay.yourdomain.com/*"
+# zone_name = "yourdomain.com"
