@@ -1,226 +1,387 @@
-import { DurableObject } from "cloudflare:workers";
+import { DurableObject } from 'cloudflare:workers'
 
-// ── Types ────────────────────────────────────────────────────────────────────
+const CONFIG = {
+  SESSION_ID_LENGTH: 8,
+  SESSION_ID_CHARSET: 'abcdefghijklmnopqrstuvwxyz0123456789',
+  ROUTES: {
+    CONNECT: "/connect",
+    SESSION: /^\/s\/([a-z0-9]+)(\/.*)?$/,
+    HEALTH: "/health",
+    OPTIONS: '*',
+  },
+  MAX_BODY_BYTES: 1_000_000,
+  FALLBACK_BASE_URL: 'https://tern-relay.hookflo-tern.workers.dev',
+  CORS_ORIGIN: '*',
+  CORS_METHODS: 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
+  CORS_HEADERS: '*',
+  PLATFORM_ACK: {
+    status: 200,
+    body: JSON.stringify({ received: true }),
+  },
+  DO_INSTANCE_NAME: 'global',
+  STRIP_HEADER_PREFIXES: ['cf-'],
+  STRIP_HEADERS_EXACT: ['host', 'connection', 'keep-alive'],
+  INTERNAL_ROUTES: {
+    CONNECT: "/connect",
+    FORWARD: "/forward",
+    HEALTH: "/health",
+  },
+  RESPONSES: {
+    NOT_FOUND: 'Not found',
+    BAD_REQUEST: 'Bad request',
+    EXPECTED_WEBSOCKET: 'Expected WebSocket upgrade',
+    NO_SESSION: 'No CLI connected. Start tern-dev first.',
+    PAYLOAD_TOO_LARGE: 'Payload too large',
+    INTERNAL_HOST: 'do-internal',
+    CONTENT_TYPE_JSON: 'application/json',
+  },
+  REQUEST_ID: {
+    PREFIX: 'req_',
+    RANDOM_SLICE_START: 2,
+    RANDOM_SLICE_END: 7,
+    RADIX: 36,
+  },
+  STATUS: {
+    SWITCHING_PROTOCOLS: 101,
+    NO_CONTENT: 204,
+    OK: 200,
+    BAD_REQUEST: 400,
+    NOT_FOUND: 404,
+    PAYLOAD_TOO_LARGE: 413,
+    UPGRADE_REQUIRED: 426,
+  },
+} as const
 
 interface Env {
-  SESSIONS: DurableObjectNamespace;
+  SESSIONS: DurableObjectNamespace<SessionDurableObject>
 }
 
-interface RelayConnected {
-  type: "connected";
-  url: string;
-  sessionId: string;
+interface RelayConnectedMsg {
+  type: 'connected'
+  url: string
+  sessionId: string
 }
 
-interface RelayRequest {
-  type: "request";
-  id: string;
-  method: string;
-  path: string;
-  headers: Record<string, string>;
-  body: string;
-  receivedAt: string;
+interface RelayRequestMsg {
+  type: 'request'
+  id: string
+  method: string
+  path: string
+  headers: Record<string, string>
+  body: string
+  receivedAt: string
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+type RelayMsg = RelayConnectedMsg | RelayRequestMsg
 
-const CHARSET = "abcdefghijklmnopqrstuvwxyz0123456789";
-
-function generateSessionId(length = 8): string {
-  const bytes = new Uint8Array(length);
-  crypto.getRandomValues(bytes);
-  return Array.from(bytes, (b) => CHARSET[b % CHARSET.length]).join("");
+function corsHeaders(): Record<string, string> {
+  return {
+    'access-control-allow-origin': CONFIG.CORS_ORIGIN,
+    'access-control-allow-methods': CONFIG.CORS_METHODS,
+    'access-control-allow-headers': CONFIG.CORS_HEADERS,
+  }
 }
 
-// ── Worker entrypoint ────────────────────────────────────────────────────────
-//
-// ALL requests route to a SINGLE Durable Object instance called "global".
-// That one instance holds ALL active WebSocket sessions in a Map.
-// This guarantees the same instance handles both WS connect and HTTP POST.
+function jsonHeaders(): Record<string, string> {
+  return {
+    'content-type': CONFIG.RESPONSES.CONTENT_TYPE_JSON,
+    ...corsHeaders(),
+  }
+}
+
+function generateSessionId(): string {
+  const bytes = new Uint8Array(CONFIG.SESSION_ID_LENGTH)
+  crypto.getRandomValues(bytes)
+  return Array.from(
+    bytes,
+    (byte) =>
+      CONFIG.SESSION_ID_CHARSET[byte % CONFIG.SESSION_ID_CHARSET.length],
+  ).join('')
+}
+
+function generateRequestId(): string {
+  const ts = Date.now().toString(CONFIG.REQUEST_ID.RADIX)
+  const rand = Math.random()
+    .toString(CONFIG.REQUEST_ID.RADIX)
+    .slice(
+      CONFIG.REQUEST_ID.RANDOM_SLICE_START,
+      CONFIG.REQUEST_ID.RANDOM_SLICE_END,
+    )
+  return `${CONFIG.REQUEST_ID.PREFIX}${ts}_${rand}`
+}
+
+function sanitiseHeaders(request: Request): Record<string, string> {
+  const exactHeaders: Set<string> = new Set(CONFIG.STRIP_HEADERS_EXACT)
+  const out: Record<string, string> = {}
+
+  request.headers.forEach((value, key) => {
+    const lower = key.toLowerCase()
+    if (exactHeaders.has(lower)) return
+    if (
+      CONFIG.STRIP_HEADER_PREFIXES.some((prefix) => lower.startsWith(prefix))
+    ) {
+      return
+    }
+    out[lower] = value
+  })
+
+  return out
+}
+
+function bodyExceedsDeclaredLimit(request: Request): boolean {
+  const contentLength = request.headers.get('content-length')
+  if (!contentLength) return false
+
+  const parsed = Number.parseInt(contentLength, 10)
+  if (Number.isNaN(parsed)) return false
+
+  return parsed > CONFIG.MAX_BODY_BYTES
+}
+
+function resolvePublicBase(request: Request): string {
+  const url = new URL(request.url)
+  if (url.host) {
+    return `https://${url.host}`
+  }
+  return CONFIG.FALLBACK_BASE_URL
+}
+
+function platformAckResponse(): Response {
+  return new Response(CONFIG.PLATFORM_ACK.body, {
+    status: CONFIG.PLATFORM_ACK.status,
+    headers: jsonHeaders(),
+  })
+}
+
+function textResponse(body: string, status: number): Response {
+  return new Response(body, {
+    status,
+    headers: corsHeaders(),
+  })
+}
+
+function jsonResponse(body: string, status: number): Response {
+  return new Response(body, {
+    status,
+    headers: jsonHeaders(),
+  })
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-    const isWsUpgrade =
-      request.headers.get("upgrade")?.toLowerCase() === "websocket";
-
-    // Always route to the single global DO instance
-    const stub = env.SESSIONS.get(env.SESSIONS.idFromName("global"));
-
-    // /connect — CLI WebSocket upgrade
-    if (url.pathname === "/connect" && isWsUpgrade) {
-      const sessionId = generateSessionId();
-      return stub.fetch(
-        new Request(`https://session/connect?sessionId=${sessionId}`, request),
-      );
+    if (
+      CONFIG.ROUTES.OPTIONS === '*' &&
+      request.method === 'OPTIONS'
+    ) {
+      return new Response(null, {
+        status: CONFIG.STATUS.NO_CONTENT,
+        headers: corsHeaders(),
+      })
     }
 
-    // /s/<sessionId>/<...path> — incoming webhook from platform
-    const match = url.pathname.match(/^\/s\/([a-z0-9]+)(\/.*)?$/);
-    if (match) {
-      const sessionId = match[1];
-      const webhookPath = match[2] || "/";
+    const url = new URL(request.url)
+    const stub = env.SESSIONS.get(env.SESSIONS.idFromName(CONFIG.DO_INSTANCE_NAME))
+    const isWsUpgrade =
+      request.headers.get('upgrade')?.toLowerCase() === 'websocket'
+
+    if (request.method === 'GET' && url.pathname === CONFIG.ROUTES.HEALTH) {
       return stub.fetch(
         new Request(
-          `https://session/forward/${sessionId}${webhookPath}`,
+          `https://${CONFIG.RESPONSES.INTERNAL_HOST}${CONFIG.INTERNAL_ROUTES.HEALTH}`,
           request,
         ),
-      );
+      )
     }
 
-    // /health
-    if (url.pathname === "/health") {
-      return stub.fetch(new Request("https://session/health", request));
+    if (
+      request.method === 'GET' &&
+      url.pathname === CONFIG.ROUTES.CONNECT &&
+      isWsUpgrade
+    ) {
+      const sessionId = generateSessionId()
+      const base = resolvePublicBase(request)
+      const connectUrl = new URL(
+        `https://${CONFIG.RESPONSES.INTERNAL_HOST}${CONFIG.INTERNAL_ROUTES.CONNECT}`,
+      )
+      connectUrl.searchParams.set('sessionId', sessionId)
+      connectUrl.searchParams.set('base', base)
+      return stub.fetch(new Request(connectUrl.toString(), request))
     }
 
-    return new Response("Not found", { status: 404 });
+    const sessionMatch = url.pathname.match(CONFIG.ROUTES.SESSION)
+    if (request.method === 'POST' && sessionMatch) {
+      const sessionId = sessionMatch[1]
+      const webhookPath = sessionMatch[2] ?? '/'
+      const forwardUrl = new URL(
+        `https://${CONFIG.RESPONSES.INTERNAL_HOST}${CONFIG.INTERNAL_ROUTES.FORWARD}`,
+      )
+      forwardUrl.searchParams.set('sessionId', sessionId)
+      forwardUrl.searchParams.set('path', webhookPath)
+      return stub.fetch(new Request(forwardUrl.toString(), request))
+    }
+
+    return textResponse(CONFIG.RESPONSES.NOT_FOUND, CONFIG.STATUS.NOT_FOUND)
   },
-};
-
-// ── SessionDurableObject ─────────────────────────────────────────────────────
-// Single global instance — holds ALL active sessions in one Map.
+}
 
 export class SessionDurableObject extends DurableObject {
-  private sessions: Map<string, WebSocket> = new Map();
-
   async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
+    const url = new URL(request.url)
+
+    if (url.pathname === CONFIG.INTERNAL_ROUTES.CONNECT) {
+      const sessionId = url.searchParams.get('sessionId')
+      const publicBase = url.searchParams.get('base')
+
+      if (!sessionId || !publicBase) {
+        return textResponse(
+          CONFIG.RESPONSES.BAD_REQUEST,
+          CONFIG.STATUS.BAD_REQUEST,
+        )
+      }
+
+      return this.handleConnect(request, sessionId, publicBase)
+    }
+
+    if (url.pathname === CONFIG.INTERNAL_ROUTES.FORWARD) {
+      const sessionId = url.searchParams.get('sessionId')
+      const webhookPath = url.searchParams.get('path')
+
+      if (!sessionId || !webhookPath) {
+        return textResponse(
+          CONFIG.RESPONSES.BAD_REQUEST,
+          CONFIG.STATUS.BAD_REQUEST,
+        )
+      }
+
+      return this.handleForward(request, sessionId, webhookPath)
+    }
+
+    if (url.pathname === CONFIG.INTERNAL_ROUTES.HEALTH) {
+      return this.handleHealth()
+    }
+
+    return textResponse(CONFIG.RESPONSES.NOT_FOUND, CONFIG.STATUS.NOT_FOUND)
+  }
+
+  async handleConnect(
+    request: Request,
+    sessionId: string,
+    publicBase: string,
+  ): Promise<Response> {
     const isWsUpgrade =
-      request.headers.get("upgrade")?.toLowerCase() === "websocket";
+      request.headers.get('upgrade')?.toLowerCase() === 'websocket'
 
-    // /connect — CLI establishing tunnel
-    if (url.pathname === "/connect") {
-      const sessionId = url.searchParams.get("sessionId")!;
-
-      if (!isWsUpgrade) {
-        return new Response("Expected WebSocket upgrade", { status: 426 });
-      }
-
-      const [client, server] = Object.values(new WebSocketPair()) as [
-        WebSocket,
-        WebSocket,
-      ];
-
-      this.ctx.acceptWebSocket(server, [sessionId]);
-      this.sessions.set(sessionId, server);
-
-      const host =
-        request.headers.get("x-forwarded-host") ??
-        request.headers.get("host") ??
-        "tern-relay.hookflo-tern.workers.dev";
-
-      const baseUrl = `https://${host.replace(":8787", "")}`;
-      const publicUrl = `${baseUrl}/s/${sessionId}`;
-
-      const msg: RelayConnected = {
-        type: "connected",
-        url: publicUrl,
-        sessionId,
-      };
-      server.send(JSON.stringify(msg));
-
-      return new Response(null, { status: 101, webSocket: client });
+    if (!isWsUpgrade) {
+      return textResponse(
+        CONFIG.RESPONSES.EXPECTED_WEBSOCKET,
+        CONFIG.STATUS.UPGRADE_REQUIRED,
+      )
     }
 
-    // /forward/<sessionId>/<...path> — incoming webhook
-    if (url.pathname.startsWith("/forward/")) {
-      const forwardMatch = url.pathname.match(
-        /^\/forward\/([a-z0-9]+)(\/.*)?$/,
-      );
-      if (!forwardMatch) {
-        return new Response("Bad request", { status: 400 });
-      }
+    const pair = new WebSocketPair()
+    const client = pair[0]
+    const server = pair[1]
 
-      const sessionId = forwardMatch[1];
-      const webhookPath = forwardMatch[2] || "/";
+    this.ctx.acceptWebSocket(server, [sessionId])
 
-      // Try in-memory map first
-      let socket = this.sessions.get(sessionId);
-
-      // Fall back to hibernation websockets
-      if (!socket) {
-        const hibernated = this.ctx.getWebSockets(sessionId);
-        if (hibernated.length > 0) {
-          socket = hibernated[0];
-          this.sessions.set(sessionId, socket);
-        }
-      }
-
-      if (!socket) {
-        return new Response(
-          JSON.stringify({ error: "No CLI connected. Start tern-dev first." }),
-          { status: 404, headers: { "content-type": "application/json" } },
-        );
-      }
-
-      const body = await request.text();
-
-      const headers: Record<string, string> = {};
-      request.headers.forEach((value, key) => {
-        if (!key.startsWith("cf-") && key !== "host") {
-          headers[key] = value;
-        }
-      });
-
-      const msg: RelayRequest = {
-        type: "request",
-        id: `req_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        method: request.method,
-        path: webhookPath,
-        headers,
-        body,
-        receivedAt: new Date().toISOString(),
-      };
-
-      try {
-        socket.send(JSON.stringify(msg));
-      } catch {
-        this.sessions.delete(sessionId);
-        return new Response(
-          JSON.stringify({ error: "CLI disconnected. Restart tern-dev." }),
-          { status: 404, headers: { "content-type": "application/json" } },
-        );
-      }
-
-      return new Response(JSON.stringify({ received: true }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
+    const msg: RelayConnectedMsg = {
+      type: 'connected',
+      url: `${publicBase}/s/${sessionId}`,
+      sessionId,
     }
+    const payload: RelayMsg = msg
+    server.send(JSON.stringify(payload))
 
-    // /health
-    if (url.pathname === "/health") {
-      const hibernated = this.ctx.getWebSockets();
-      return new Response(
-        JSON.stringify({
-          ok: true,
-          activeSessions: hibernated.length,
-          memSessions: this.sessions.size,
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      );
-    }
+    console.log(`[relay] session connected: ${sessionId}`)
 
-    return new Response("Not found", { status: 404 });
+    return new Response(null, {
+      status: CONFIG.STATUS.SWITCHING_PROTOCOLS,
+      webSocket: client,
+      headers: corsHeaders(),
+    })
   }
 
-  webSocketMessage(_ws: WebSocket, _message: string | ArrayBuffer) {}
-
-  webSocketClose(_ws: WebSocket, _code: number, _reason: string) {
-    for (const [id, socket] of this.sessions.entries()) {
-      if (socket === _ws) {
-        this.sessions.delete(id);
-        break;
-      }
+  async handleForward(
+    request: Request,
+    sessionId: string,
+    webhookPath: string,
+  ): Promise<Response> {
+    if (bodyExceedsDeclaredLimit(request)) {
+      return textResponse(
+        CONFIG.RESPONSES.PAYLOAD_TOO_LARGE,
+        CONFIG.STATUS.PAYLOAD_TOO_LARGE,
+      )
     }
+
+    const sockets = this.ctx.getWebSockets(sessionId)
+    const socket = sockets[0]
+
+    if (!socket) {
+      return jsonResponse(
+        JSON.stringify({ error: CONFIG.RESPONSES.NO_SESSION }),
+        CONFIG.STATUS.NOT_FOUND,
+      )
+    }
+
+    const body = await request.text()
+    if (body.length > CONFIG.MAX_BODY_BYTES) {
+      return textResponse(
+        CONFIG.RESPONSES.PAYLOAD_TOO_LARGE,
+        CONFIG.STATUS.PAYLOAD_TOO_LARGE,
+      )
+    }
+
+    const msg: RelayRequestMsg = {
+      type: 'request',
+      id: generateRequestId(),
+      method: request.method,
+      path: webhookPath,
+      headers: sanitiseHeaders(request),
+      body,
+      receivedAt: new Date().toISOString(),
+    }
+
+    const payload: RelayMsg = msg
+
+    try {
+      socket.send(JSON.stringify(payload))
+    } catch (error: unknown) {
+      if (error instanceof Error) {
+        console.error(`[relay] error:`, error.message)
+      } else {
+        console.error(`[relay] error:`, String(error))
+      }
+      return platformAckResponse()
+    }
+
+    console.log(`[relay] forwarded ${request.method} ${webhookPath} → ${sessionId}`)
+    return platformAckResponse()
   }
 
-  webSocketError(_ws: WebSocket, _error: unknown) {
-    for (const [id, socket] of this.sessions.entries()) {
-      if (socket === _ws) {
-        this.sessions.delete(id);
-        break;
-      }
-    }
+  async handleHealth(): Promise<Response> {
+    const activeSessions = this.ctx.getWebSockets().length
+    return jsonResponse(
+      JSON.stringify({
+        ok: true,
+        sessions: activeSessions,
+        ts: new Date().toISOString(),
+      }),
+      CONFIG.STATUS.OK,
+    )
+  }
+
+  webSocketMessage(_ws: WebSocket, _message: string | ArrayBuffer): void {}
+
+  webSocketClose(ws: WebSocket, code: number, _reason: string): void {
+    const tag = this.ctx.getTags(ws)[0] ?? 'unknown'
+    console.log(`[relay] session disconnected: ${tag} (code=${code})`)
+  }
+
+  webSocketError(ws: WebSocket, error: unknown): void {
+    const tag = this.ctx.getTags(ws)[0] ?? 'unknown'
+    console.error(
+      `[relay] websocket error for session ${tag}:`,
+      error instanceof Error ? error.message : String(error),
+    )
   }
 }
