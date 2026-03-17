@@ -7,7 +7,6 @@ const CONFIG = {
     CONNECT: "/connect",
     SESSION: /^\/s\/([a-z0-9]+)(\/.*)?$/,
     HEALTH: "/health",
-    OPTIONS: '*',
   },
   MAX_BODY_BYTES: 1_000_000,
   FALLBACK_BASE_URL: 'https://tern-relay.hookflo-tern.workers.dev',
@@ -72,7 +71,6 @@ interface RelayRequestMsg {
   receivedAt: string
 }
 
-type RelayMsg = RelayConnectedMsg | RelayRequestMsg
 
 function corsHeaders(): Record<string, string> {
   return {
@@ -169,10 +167,7 @@ function jsonResponse(body: string, status: number): Response {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    if (
-      CONFIG.ROUTES.OPTIONS === '*' &&
-      request.method === 'OPTIONS'
-    ) {
+    if (request.method === 'OPTIONS') {
       return new Response(null, {
         status: CONFIG.STATUS.NO_CONTENT,
         headers: corsHeaders(),
@@ -209,7 +204,7 @@ export default {
     }
 
     const sessionMatch = url.pathname.match(CONFIG.ROUTES.SESSION)
-    if (request.method === 'POST' && sessionMatch) {
+    if (sessionMatch) {
       const sessionId = sessionMatch[1]
       const webhookPath = sessionMatch[2] ?? '/'
       const forwardUrl = new URL(
@@ -289,8 +284,7 @@ export class SessionDurableObject extends DurableObject {
       url: `${publicBase}/s/${sessionId}`,
       sessionId,
     }
-    const payload: RelayMsg = msg
-    server.send(JSON.stringify(payload))
+    server.send(JSON.stringify(msg))
 
     console.log(`[relay] session connected: ${sessionId}`)
 
@@ -341,10 +335,8 @@ export class SessionDurableObject extends DurableObject {
       receivedAt: new Date().toISOString(),
     }
 
-    const payload: RelayMsg = msg
-
     try {
-      socket.send(JSON.stringify(payload))
+      socket.send(JSON.stringify(msg))
     } catch (error: unknown) {
       if (error instanceof Error) {
         console.error(`[relay] error:`, error.message)
