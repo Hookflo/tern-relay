@@ -11,7 +11,7 @@ bindings = [
 # ── If you already deployed with tag "v1", bump to "v2" here
 # ── If deploying fresh, "v1" is fine
 [[migrations]]
-tag = "v2"
+tag = "v1"
 new_sqlite_classes = ["SessionDurableObject"]
 
 # ── Uncomment and fill in after setting up custom domain in CF dashboard
