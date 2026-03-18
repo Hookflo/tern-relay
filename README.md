@@ -2,7 +2,7 @@
 
 WebSocket relay for [@hookflo/tern-dev](https://github.com/hookflo/tern-dev).
 
-Dumb pipe. Stores nothing. Logs nothing. 80 lines. MIT.
+Dumb pipe. Stores nothing. Logs nothing. 80 lines. MIT. 
 
 ---
 
