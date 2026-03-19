@@ -93,6 +93,17 @@ After deploy, go to:
 
 Your URL is: `https://tern-relay.<your-subdomain>.workers.dev`
 
+**Step 5.1 — Set a single default relay base URL (recommended)**
+
+Set one variable in `wrangler.toml` so you do not need to edit URLs in multiple places:
+
+```toml
+[vars]
+RELAY_PUBLIC_BASE_URL = "https://tern-relay.<your-subdomain>.workers.dev"
+```
+
+This value is used in `/connect` responses as the public relay URL base.
+
 **Step 6 — Point tern-dev at your relay**
 ```bash
 # Basic usage — forwards everything to localhost:3000
@@ -107,20 +118,6 @@ RELAY_URL=wss://tern-relay.<your-subdomain>.workers.dev \
 export RELAY_URL=wss://tern-relay.<your-subdomain>.workers.dev
 npx @hookflo/tern-dev --port 3000
 ```
-
----
-
-## Setting up a custom domain (optional)
-
-If you want `relay.yourdomain.com` instead of `workers.dev`:
-
-1. Your domain must be on Cloudflare (or transfer it there)
-2. Cloudflare dashboard → your domain → **Workers Routes**
-3. Add route: `relay.yourdomain.com/*` → select `tern-relay` worker
-4. Update `wrangler.toml` (uncomment the routes section, fill in your domain)
-5. Push to main to redeploy
-
-Then use: `RELAY_URL=wss://relay.yourdomain.com npx @hookflo/tern-dev --port 3000`
 
 ---
 
@@ -190,6 +187,16 @@ Relay → CLI: path = "/webhooks/stripe"
 CLI forwards → localhost:3000/webhooks/stripe
 ```
 
+## tern-dev CLI flags (quick reference)
+
+When you publish your own relay, point `tern-dev` to it with `--relay`.
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--relay` | string | `wss://tern-relay.hookflo-tern.workers.dev` | Relay websocket URL |
+| `--port` | number | `3000` | Local server port to forward to |
+| `--path` | string | `/` | Local webhook path to forward to |
+
 ---
 
 ## Configuration reference
@@ -229,6 +236,9 @@ Paid tier ($5/month) is 10 million requests/month — more than enough for serio
 - The relay is a dumb pipe — it never parses, stores, or logs webhook bodies
 - Session IDs are cryptographically random (Web Crypto API)
 - Sessions exist only while the CLI WebSocket is open — no persistence
+- Request IDs are generated with cryptographic randomness
+- Webhook forwarding strips infrastructure headers before relaying
+- Session IDs are validated server-side before any forwarding
 - The relay source is fully auditable at ~80 lines
 - Self-hosting is supported for zero-trust environments
 

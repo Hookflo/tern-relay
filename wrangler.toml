@@ -3,6 +3,10 @@ main = "src/worker.ts"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
+[vars]
+# Override this after deployment if you want a stable public URL in connect responses.
+RELAY_PUBLIC_BASE_URL = "https://tern-relay.hookflo-tern.workers.dev"
+
 [durable_objects]
 bindings = [
   { name = "SESSIONS", class_name = "SessionDurableObject" }
@@ -13,8 +17,3 @@ bindings = [
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["SessionDurableObject"]
-
-# ── Uncomment and fill in after setting up custom domain in CF dashboard
-# [[routes]]
-# pattern = "relay.yourdomain.com/*"
-# zone_name = "yourdomain.com"
