@@ -53,6 +53,7 @@ const CONFIG = {
 
 interface Env {
   SESSIONS: DurableObjectNamespace<SessionDurableObject>
+  RELAY_PUBLIC_BASE_URL?: string
 }
 
 interface RelayConnectedMsg {
@@ -99,8 +100,12 @@ function generateSessionId(): string {
 
 function generateRequestId(): string {
   const ts = Date.now().toString(CONFIG.REQUEST_ID.RADIX)
-  const rand = Math.random()
-    .toString(CONFIG.REQUEST_ID.RADIX)
+  const randomBytes = new Uint8Array(4)
+  crypto.getRandomValues(randomBytes)
+  const rand = Array.from(randomBytes, (byte) =>
+    byte.toString(CONFIG.REQUEST_ID.RADIX).padStart(2, '0'),
+  )
+    .join('')
     .slice(
       CONFIG.REQUEST_ID.RANDOM_SLICE_START,
       CONFIG.REQUEST_ID.RANDOM_SLICE_END,
@@ -136,12 +141,24 @@ function bodyExceedsDeclaredLimit(request: Request): boolean {
   return parsed > CONFIG.MAX_BODY_BYTES
 }
 
-function resolvePublicBase(request: Request): string {
+function resolvePublicBase(request: Request, env: Env): string {
+  const configuredBase = env.RELAY_PUBLIC_BASE_URL?.trim()
+  if (configuredBase) {
+    return configuredBase.replace(/\/+$/, '')
+  }
+
   const url = new URL(request.url)
   if (url.host) {
     return `https://${url.host}`
   }
   return CONFIG.FALLBACK_BASE_URL
+}
+
+function isValidSessionId(sessionId: string): boolean {
+  return (
+    sessionId.length === CONFIG.SESSION_ID_LENGTH &&
+    /^[a-z0-9]+$/.test(sessionId)
+  )
 }
 
 function platformAckResponse(): Response {
@@ -194,7 +211,7 @@ export default {
       isWsUpgrade
     ) {
       const sessionId = generateSessionId()
-      const base = resolvePublicBase(request)
+      const base = resolvePublicBase(request, env)
       const connectUrl = new URL(
         `https://${CONFIG.RESPONSES.INTERNAL_HOST}${CONFIG.INTERNAL_ROUTES.CONNECT}`,
       )
@@ -206,6 +223,12 @@ export default {
     const sessionMatch = url.pathname.match(CONFIG.ROUTES.SESSION)
     if (sessionMatch) {
       const sessionId = sessionMatch[1]
+      if (!isValidSessionId(sessionId)) {
+        return textResponse(
+          CONFIG.RESPONSES.BAD_REQUEST,
+          CONFIG.STATUS.BAD_REQUEST,
+        )
+      }
       const webhookPath = sessionMatch[2] ?? '/'
       const forwardUrl = new URL(
         `https://${CONFIG.RESPONSES.INTERNAL_HOST}${CONFIG.INTERNAL_ROUTES.FORWARD}`,
@@ -228,6 +251,12 @@ export class SessionDurableObject extends DurableObject {
       const publicBase = url.searchParams.get('base')
 
       if (!sessionId || !publicBase) {
+        return textResponse(
+          CONFIG.RESPONSES.BAD_REQUEST,
+          CONFIG.STATUS.BAD_REQUEST,
+        )
+      }
+      if (!isValidSessionId(sessionId)) {
         return textResponse(
           CONFIG.RESPONSES.BAD_REQUEST,
           CONFIG.STATUS.BAD_REQUEST,
@@ -318,7 +347,7 @@ export class SessionDurableObject extends DurableObject {
     }
 
     const body = await request.text()
-    if (body.length > CONFIG.MAX_BODY_BYTES) {
+    if (new TextEncoder().encode(body).byteLength > CONFIG.MAX_BODY_BYTES) {
       return textResponse(
         CONFIG.RESPONSES.PAYLOAD_TOO_LARGE,
         CONFIG.STATUS.PAYLOAD_TOO_LARGE,
@@ -346,7 +375,7 @@ export class SessionDurableObject extends DurableObject {
       return platformAckResponse()
     }
 
-    console.log(`[relay] forwarded ${request.method} ${webhookPath} → ${sessionId}`)
+    console.log(`[relay] forwarded ${request.method} → ${sessionId}`)
     return platformAckResponse()
   }
 
